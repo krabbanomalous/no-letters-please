@@ -95,8 +95,8 @@ def api_headers():
     }
 
 
-# gets page of addresses
-def fetch_page(location, result_index, property_types=None):
+# gets page of addresses, or property IDs when ids_only is enabled
+def fetch_page(location, result_index, property_types=None, ids_only=False):
     global _request_count
     payload = {
         "locations": [location],
@@ -105,6 +105,8 @@ def fetch_page(location, result_index, property_types=None):
         "result_index": result_index,
         "house": True,
     }
+    if ids_only:
+        payload["ids_only"] = True
     for attempt in range(1, MAX_ATTEMPTS + 1):
         if _request_count >= TOKEN_ROTATE_EVERY:
             new_session()
@@ -138,9 +140,9 @@ def fetch_page(location, result_index, property_types=None):
 
 
 # yields (query_key, result_index, data) for every page of a zip
-def iter_zip_pages(state, zip_code, delay):
+def iter_zip_pages(state, zip_code, delay, ids_only=False):
     location = {"state": state, "zip": zip_code}
-    first = fetch_page(location, 0)
+    first = fetch_page(location, 0, ids_only=ids_only)
     total = first.get("result_count") or 0
 
     if total <= MAX_RESULT_INDEX:
@@ -148,7 +150,7 @@ def iter_zip_pages(state, zip_code, delay):
         result_index = PAGE_SIZE
         while result_index < total and result_index < MAX_RESULT_INDEX:
             time.sleep(delay)
-            data = fetch_page(location, result_index)
+            data = fetch_page(location, result_index, ids_only=ids_only)
             yield "ALL", result_index, data
             if len(data.get("response", [])) < PAGE_SIZE:
                 break
@@ -161,7 +163,7 @@ def iter_zip_pages(state, zip_code, delay):
             while result_index < MAX_RESULT_INDEX:
                 if result_index > 0 or ptype != RESIDENTIAL_TYPES[0]:
                     time.sleep(delay)
-                data = fetch_page(location, result_index, [ptype])
+                data = fetch_page(location, result_index, [ptype], ids_only=ids_only)
                 if result_index == 0:
                     sub_total = data.get("result_count") or 0
                     if sub_total > MAX_RESULT_INDEX:
@@ -201,6 +203,11 @@ def extract_rows(batch):
     return rows
 
 
+# gets property IDs from an ids_only page
+def extract_ids(batch):
+    return [item for item in batch if isinstance(item, int) and not isinstance(item, bool)]
+
+
 def load_zips(state):
     if not os.path.exists(ZIP_CSV):
         print(f"downloading zip list -> {ZIP_CSV}")
@@ -234,9 +241,15 @@ def load_progress(progress_path):
     return pages_done, zips_done
 
 
-def crawl_state(state, delay=1.0, max_zips=None):
-    csv_path = f"{state.lower()}_residential_addrs.csv"
-    progress_path = f"{state.lower()}_zips_done.txt"
+def crawl_state(state, delay=1.0, max_zips=None, ids_only=False):
+    if ids_only:
+        csv_path = f"{state.lower()}_residential_property_ids.csv"
+        progress_path = f"{state.lower()}_property_ids_zips_done.txt"
+        fieldnames = ["property_id"]
+    else:
+        csv_path = f"{state.lower()}_residential_addrs.csv"
+        progress_path = f"{state.lower()}_zips_done.txt"
+        fieldnames = ["address", "city", "state", "zip"]
 
     pages_done, zips_done = load_progress(progress_path)
     zips = load_zips(state)
@@ -251,7 +264,7 @@ def crawl_state(state, delay=1.0, max_zips=None):
     with open(csv_path, "a", newline="", encoding="utf-8") as csv_f, open(
         progress_path, "a", encoding="utf-8"
     ) as prog_f:
-        writer = csv.DictWriter(csv_f, fieldnames=["address", "city", "state", "zip"])
+        writer = csv.DictWriter(csv_f, fieldnames=fieldnames)
         if new_file:
             writer.writeheader()
 
@@ -259,11 +272,20 @@ def crawl_state(state, delay=1.0, max_zips=None):
             zip_rows = 0
             seen = set()
             try:
-                for query_key, result_index, data in iter_zip_pages(state, zip_code, delay):
+                for query_key, result_index, data in iter_zip_pages(
+                    state, zip_code, delay, ids_only=ids_only
+                ):
                     if (zip_code, query_key, result_index) in pages_done:
                         continue  # written by a previous (interrupted) run
-                    for row in extract_rows(data.get("response", [])):
-                        key = (row["address"], row["zip"])
+                    if ids_only:
+                        rows = [
+                            {"property_id": property_id}
+                            for property_id in extract_ids(data.get("response", []))
+                        ]
+                    else:
+                        rows = extract_rows(data.get("response", []))
+                    for row in rows:
+                        key = row["property_id"] if ids_only else (row["address"], row["zip"])
                         if key in seen:
                             continue
                         seen.add(key)
@@ -291,6 +313,11 @@ if __name__ == "__main__":
     parser.add_argument("states", nargs="*", default=["TX", "FL"], help="state codes (default: TX)")
     parser.add_argument("--max-zips", type=int, default=None, help="limit zips per state (for testing)")
     parser.add_argument("--delay", type=float, default=1.0, help="seconds between API calls")
+    parser.add_argument(
+        "--ids-only",
+        action="store_true",
+        help="fetch only property IDs into a separate CSV",
+    )
     args = parser.parse_args()
 
     new_session()
@@ -299,7 +326,12 @@ if __name__ == "__main__":
         totals = {}
         for state in args.states:
             if state != "FL":
-                totals[state] = crawl_state(state.upper(), delay=args.delay, max_zips=args.max_zips)
+                totals[state] = crawl_state(
+                    state.upper(),
+                    delay=args.delay,
+                    max_zips=args.max_zips,
+                    ids_only=args.ids_only,
+                )
     except KeyboardInterrupt:
         print("\ninterrupted - progress is saved; rerun to resume where it left off")
         raise SystemExit(130)
