@@ -1,3 +1,8 @@
 tx_residential_addrs.csv
 tx_zips_done.txt
 us_zipcodes.csv
+fl_residential_properties.parquet
+fl_properties_zips_done.txt
+tx_residential_properties.zip
+tx_properties_zips_done.txt
+tx_residential_properties.parquet

@@ -4,10 +4,12 @@ import html
 import json
 import os
 import re
+import shutil
 import time
+from pathlib import Path
 
-import normalize_address as na
-
+import pyarrow as pa
+import pyarrow.parquet as pq
 from dotenv import load_dotenv
 from curl_cffi import requests as creq
 
@@ -42,10 +44,24 @@ MAX_RESULT_INDEX = 10000          # API returns nothing past this offset, so we 
 TOKEN_TTL_SECONDS = 90 * 60       # guest JWT lasts 2h; refresh early
 TOKEN_ROTATE_EVERY = 50           # DataDome throttles per token; swap it out regularly
 MAX_ATTEMPTS = 10                 # retries per request before giving up
+PARQUET_BATCH_SIZE = 5000
 
 # Residential-only property types (drop "land")
 RESIDENTIAL_TYPES = ["mobile", "mfh_5_plus", "mfh_2_to_4", "condo", "sfr"]
 RESIDENTIAL_TYPES_UPPER = {t.upper() for t in RESIDENTIAL_TYPES}
+
+# Parquet has no primary-key constraint, so property_id is the first column and
+# is deduplicated before writing. entry_json preserves every API field losslessly.
+PARQUET_SCHEMA = pa.schema(
+    [
+        pa.field("property_id", pa.int64(), nullable=False),
+        pa.field("address", pa.string()),
+        pa.field("city", pa.string()),
+        pa.field("state", pa.string()),
+        pa.field("zip", pa.string()),
+        pa.field("entry_json", pa.string(), nullable=False),
+    ]
+)
 
 _session = None
 _token = None
@@ -95,8 +111,8 @@ def api_headers():
     }
 
 
-# gets page of addresses, or property IDs when ids_only is enabled
-def fetch_page(location, result_index, property_types=None, ids_only=False):
+# gets one page of complete property entries
+def fetch_page(location, result_index, property_types=None):
     global _request_count
     payload = {
         "locations": [location],
@@ -105,8 +121,6 @@ def fetch_page(location, result_index, property_types=None, ids_only=False):
         "result_index": result_index,
         "house": True,
     }
-    if ids_only:
-        payload["ids_only"] = True
     for attempt in range(1, MAX_ATTEMPTS + 1):
         if _request_count >= TOKEN_ROTATE_EVERY:
             new_session()
@@ -140,9 +154,9 @@ def fetch_page(location, result_index, property_types=None, ids_only=False):
 
 
 # yields (query_key, result_index, data) for every page of a zip
-def iter_zip_pages(state, zip_code, delay, ids_only=False):
+def iter_zip_pages(state, zip_code, delay):
     location = {"state": state, "zip": zip_code}
-    first = fetch_page(location, 0, ids_only=ids_only)
+    first = fetch_page(location, 0)
     total = first.get("result_count") or 0
 
     if total <= MAX_RESULT_INDEX:
@@ -150,7 +164,7 @@ def iter_zip_pages(state, zip_code, delay, ids_only=False):
         result_index = PAGE_SIZE
         while result_index < total and result_index < MAX_RESULT_INDEX:
             time.sleep(delay)
-            data = fetch_page(location, result_index, ids_only=ids_only)
+            data = fetch_page(location, result_index)
             yield "ALL", result_index, data
             if len(data.get("response", [])) < PAGE_SIZE:
                 break
@@ -163,7 +177,7 @@ def iter_zip_pages(state, zip_code, delay, ids_only=False):
             while result_index < MAX_RESULT_INDEX:
                 if result_index > 0 or ptype != RESIDENTIAL_TYPES[0]:
                     time.sleep(delay)
-                data = fetch_page(location, result_index, [ptype], ids_only=ids_only)
+                data = fetch_page(location, result_index, [ptype])
                 if result_index == 0:
                     sub_total = data.get("result_count") or 0
                     if sub_total > MAX_RESULT_INDEX:
@@ -177,35 +191,102 @@ def iter_zip_pages(state, zip_code, delay, ids_only=False):
                 result_index += PAGE_SIZE
 
 
-# gets rows of page
-def extract_rows(batch):
+def as_string(value):
+    if value is None:
+        return None
+    return str(value)
+
+
+# converts complete API entries into rows matching PARQUET_SCHEMA
+def extract_property_rows(batch):
     rows = []
     for item in batch:
         if not isinstance(item, dict):
             continue
-        # belt-and-braces: never let a non-residential row into the CSV, even
-        # if the API returns one outside the requested property_type filter
+        # belt-and-braces: never let a non-residential row into the Parquet
+        # file, even if the API returns one outside the property_type filter
         ptype = str(item.get("property_type") or "").upper()
         if ptype not in RESIDENTIAL_TYPES_UPPER:
             continue
-        addr = item.get("address") or {}
-        street = addr.get("address")
-        if not street:
+        raw_property_id = item.get("id")
+        if isinstance(raw_property_id, bool):
             continue
+        try:
+            property_id = int(raw_property_id)
+        except (TypeError, ValueError):
+            continue
+
+        address = item.get("address") or {}
+        if not isinstance(address, dict):
+            address = {}
         rows.append(
             {
-                "address": na.normalize_address(street),
-                "city": addr.get("city", ""),
-                "state": addr.get("state", ""),
-                "zip": addr.get("zip", ""),
+                "property_id": property_id,
+                "address": as_string(address.get("address")),
+                "city": as_string(address.get("city")),
+                "state": as_string(address.get("state")),
+                "zip": as_string(address.get("zip")),
+                "entry_json": json.dumps(item, ensure_ascii=False, separators=(",", ":")),
             }
         )
     return rows
 
 
-# gets property IDs from an ids_only page
-def extract_ids(batch):
-    return [item for item in batch if isinstance(item, int) and not isinstance(item, bool)]
+def rows_to_batch(rows):
+    arrays = [
+        pa.array([row[field.name] for row in rows], type=field.type)
+        for field in PARQUET_SCHEMA
+    ]
+    return pa.record_batch(arrays, schema=PARQUET_SCHEMA)
+
+
+# writes one completed zip atomically; an interrupted .tmp file is never used
+def write_zip_part(rows, part_path):
+    part_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = part_path.with_suffix(".tmp")
+    try:
+        with pq.ParquetWriter(tmp_path, PARQUET_SCHEMA, compression="zstd") as writer:
+            for start in range(0, len(rows), PARQUET_BATCH_SIZE):
+                writer.write_batch(rows_to_batch(rows[start : start + PARQUET_BATCH_SIZE]))
+        os.replace(tmp_path, part_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+# Parquet files cannot be appended to safely, so completed zip parts are
+# compacted into the requested single state file at the end of the run.
+def compact_parts(parts_dir, output_path):
+    tmp_path = output_path.with_name(output_path.name + ".tmp")
+    total_rows = 0
+    try:
+        with pq.ParquetWriter(tmp_path, PARQUET_SCHEMA, compression="zstd") as writer:
+            for part_path in sorted(parts_dir.glob("*.parquet")):
+                parquet_file = pq.ParquetFile(part_path)
+                for batch in parquet_file.iter_batches(batch_size=PARQUET_BATCH_SIZE):
+                    writer.write_batch(batch)
+                    total_rows += batch.num_rows
+        os.replace(tmp_path, output_path)
+        return total_rows
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def format_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def progress_bar(completed, total, width=30):
+    filled = int(width * completed / total) if total else 0
+    return "[" + "█" * filled + "-" * (width - filled) + "]"
 
 
 def load_zips(state):
@@ -223,101 +304,96 @@ def load_zips(state):
     return sorted(set(zips))
 
 
-# Progress file lines are either "zip<TAB>query_key<TAB>result_index" for one
-# written page or "zip<TAB>DONE" for a finished zip. Bare "zip" lines from the
-# previous version also count as DONE.
-def load_progress(progress_path):
-    pages_done, zips_done = set(), set()
-    if os.path.exists(progress_path):
-        with open(progress_path, encoding="utf-8") as f:
+def load_zips_done(progress_path):
+    zips_done = set()
+    if progress_path.exists():
+        with progress_path.open(encoding="utf-8") as f:
             for line in f:
-                parts = line.rstrip("\n").split("\t")
-                if len(parts) == 1 and parts[0]:
-                    zips_done.add(parts[0])
-                elif len(parts) == 2 and parts[1] == "DONE":
-                    zips_done.add(parts[0])
-                elif len(parts) == 3:
-                    pages_done.add((parts[0], parts[1], int(parts[2])))
-    return pages_done, zips_done
+                zip_code = line.strip().split("\t")[0]
+                if zip_code:
+                    zips_done.add(zip_code)
+    return zips_done
 
 
-def crawl_state(state, delay=1.0, max_zips=None, ids_only=False):
-    if ids_only:
-        csv_path = f"{state.lower()}_residential_property_ids.csv"
-        progress_path = f"{state.lower()}_property_ids_zips_done.txt"
-        fieldnames = ["property_id"]
-    else:
-        csv_path = f"{state.lower()}_residential_addrs.csv"
-        progress_path = f"{state.lower()}_zips_done.txt"
-        fieldnames = ["address", "city", "state", "zip"]
+def state_paths(state):
+    state_lower = state.lower()
+    return (
+        Path(f"{state_lower}_residential_properties.parquet"),
+        Path(f".{state_lower}_property_parts"),
+        Path(f"{state_lower}_properties_zips_done.txt"),
+    )
 
-    pages_done, zips_done = load_progress(progress_path)
+
+def crawl_state(state, delay=1.0, max_zips=None):
+    output_path, parts_dir, progress_path = state_paths(state)
+    zips_done = load_zips_done(progress_path)
     zips = load_zips(state)
     todo = [z for z in zips if z not in zips_done]
     if max_zips:
         todo = todo[:max_zips]
     print(f"{state}: {len(zips)} zips total, {len(zips_done)} done, {len(todo)} to fetch")
 
-    new_file = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
     total_rows = 0
+    planned_total = len(zips_done) + len(todo)
+    completed = len(zips_done)
+    started_at = time.monotonic()
 
-    with open(csv_path, "a", newline="", encoding="utf-8") as csv_f, open(
-        progress_path, "a", encoding="utf-8"
-    ) as prog_f:
-        writer = csv.DictWriter(csv_f, fieldnames=fieldnames)
-        if new_file:
-            writer.writeheader()
-
-        for i, zip_code in enumerate(todo, 1):
-            zip_rows = 0
+    with progress_path.open("a", encoding="utf-8") as prog_f:
+        for zip_code in todo:
+            zip_rows = []
             seen = set()
             try:
-                for query_key, result_index, data in iter_zip_pages(
-                    state, zip_code, delay, ids_only=ids_only
-                ):
-                    if (zip_code, query_key, result_index) in pages_done:
-                        continue  # written by a previous (interrupted) run
-                    if ids_only:
-                        rows = [
-                            {"property_id": property_id}
-                            for property_id in extract_ids(data.get("response", []))
-                        ]
-                    else:
-                        rows = extract_rows(data.get("response", []))
-                    for row in rows:
-                        key = row["property_id"] if ids_only else (row["address"], row["zip"])
-                        if key in seen:
+                for _, _, data in iter_zip_pages(state, zip_code, delay):
+                    for row in extract_property_rows(data.get("response", [])):
+                        property_id = row["property_id"]
+                        if property_id in seen:
                             continue
-                        seen.add(key)
-                        writer.writerow(row)
-                        zip_rows += 1
-                    csv_f.flush()
-                    prog_f.write(f"{zip_code}\t{query_key}\t{result_index}\n")
-                    prog_f.flush()
+                        seen.add(property_id)
+                        zip_rows.append(row)
             except RuntimeError as e:
-                # pages already written stay in the CSV; the next run resumes
-                # this zip from its first unwritten page
-                print(f"  zip {zip_code}: FAILED ({e}); will resume next run")
+                # no part or progress is written for this zip, so the next run
+                # safely refetches it from the beginning
+                print(f"  zip {zip_code}: FAILED ({e}); will retry next run")
                 continue
-            prog_f.write(f"{zip_code}\tDONE\n")
+
+            write_zip_part(zip_rows, parts_dir / f"{zip_code}.parquet")
+            prog_f.write(f"{zip_code}\n")
             prog_f.flush()
-            total_rows += zip_rows
-            print(f"[{i}/{len(todo)}] zip {zip_code}: {zip_rows} rows | session total {total_rows:,}")
+            total_rows += len(zip_rows)
+            completed += 1
+            done_this_run = completed - len(zips_done)
+            elapsed = time.monotonic() - started_at
+            eta = elapsed / done_this_run * (planned_total - completed)
+            print(
+                f"{progress_bar(completed, planned_total)} "
+                f"{100 * completed / planned_total:5.1f}% ({completed}/{planned_total} zips) "
+                f"| zip {zip_code}: {len(zip_rows)} rows | session total {total_rows:,} "
+                f"| ETA {format_duration(eta)}"
+            )
+
+    part_files = list(parts_dir.glob("*.parquet"))
+    should_compact = part_files and (todo or max_zips is not None or not output_path.exists())
+    if should_compact:
+        compacted_rows = compact_parts(parts_dir, output_path)
+        print(f"{state}: compacted {compacted_rows:,} rows -> {output_path}")
+        if max_zips is None:
+            shutil.rmtree(parts_dir)
+    elif max_zips is None and parts_dir.exists():
+        # A prior full compaction succeeded but cleanup was interrupted. Do not
+        # rebuild the final file from any partially deleted parts directory.
+        shutil.rmtree(parts_dir)
+    elif not output_path.exists() and not todo:
+        print(f"{state}: no property data found; no Parquet file written")
 
     return total_rows
 
 
 # runs everything
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Crawl Propwire residential addresses by zip.")
+    parser = argparse.ArgumentParser(description="Crawl Propwire residential properties by zip.")
     parser.add_argument("states", nargs="*", default=["TX", "FL"], help="state codes (default: TX)")
     parser.add_argument("--max-zips", type=int, default=None, help="limit zips per state (for testing)")
     parser.add_argument("--delay", type=float, default=1.0, help="seconds between API calls")
-    parser.add_argument(
-        "--ids-only",
-        action="store_true",
-        help="fetch only property IDs into a separate CSV",
-    )
     args = parser.parse_args()
 
     new_session()
@@ -325,15 +401,9 @@ if __name__ == "__main__":
     try:
         totals = {}
         for state in args.states:
-            if state != "FL":
-                totals[state] = crawl_state(
-                    state.upper(),
-                    delay=args.delay,
-                    max_zips=args.max_zips,
-                    ids_only=args.ids_only,
-                )
+            totals[state] = crawl_state(state.upper(), delay=args.delay, max_zips=args.max_zips)
     except KeyboardInterrupt:
-        print("\ninterrupted - progress is saved; rerun to resume where it left off")
+        print("\ninterrupted - completed zips are saved; rerun to resume where it left off")
         raise SystemExit(130)
 
     for state, n in totals.items():
