@@ -11,4 +11,4 @@ def save_as_csv(state, filename):
     df = read_parquet_file(state, filename)
     df.to_csv(f"{state}_{filename}.csv", index = False)
 
-save_as_csv("fl", "32085")
+save_as_csv("tx", "75001")
